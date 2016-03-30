@@ -1,0 +1,196 @@
+#!/bin/bash
+if [ "$(id -u)" != "0" ]; then
+  echo "Error: \"$(basename "$0")\" must run as root"
+  exit 1
+fi
+
+function show_help() {
+  echo 
+  echo "  Usage: $(basename "$0") { add | remove | help } [ --options ]" >&2
+  echo
+  echo "  Action (Required)" 
+  echo "    add               Add this site to the list of VirtualHosts"
+  echo "    remove, rm        Remove this site from the list of VirtualHosts"
+  echo "    help              Show this message"
+  echo 
+  echo "  Options"
+  echo "    --path, -p        Path to site root (default: \"$PWD\")"
+  echo "    --host, -h        Hostname for local site (default: \"$(basename "$SITEPATH")\")"
+  echo
+  exit 0
+}
+
+# vhosts 
+while [[ $# > 0 ]]
+do
+key="$1"
+
+case $key in
+    -p|--path)
+    SITEPATH="$2"
+    shift # past argument
+    ;;
+    -h|--host)
+    SITEHOST="$2"
+    shift # past argument
+    ;;
+    add)
+    ACTION="add"
+    ;;
+    rm|remove)
+    ACTION="remove"
+    ;;
+    help)
+    show_help
+    ;;
+    *)
+      show_help
+    ;;
+esac
+shift # past argument or value
+done
+
+[ -z $SITEPATH ] && SITEPATH="$PWD"
+[ -z $SITEHOST ] && SITEHOST="$(basename "$SITEPATH")"
+[ -z $ACTION ] && show_help
+
+server="$SITEHOST"
+TLD="ste"
+certs="/usr/local/etc/apache2/2.4/ssl"
+vhost_dir="/usr/local/etc/apache2/2.4/other"
+vhosts="$vhost_dir/httpd-vhosts.conf"
+hosts="/private/etc/hosts.d"
+host="$hosts/$server.conf"
+
+function create_cert() {
+  cat > /tmp/openssl.cnf <<-EOF
+  [req]
+  distinguished_name = req_distinguished_name
+  x509_extensions = v3_req
+  prompt = no
+  [req_distinguished_name]
+  CN = *.${server}.$TLD
+  [v3_req]
+  keyUsage = keyEncipherment, dataEncipherment
+  extendedKeyUsage = serverAuth
+  subjectAltName = @alt_names
+  [alt_names]
+  DNS.1 = *.${server}.$TLD
+  DNS.2 = ${server}.$TLD
+EOF
+
+  openssl req \
+  -new \
+  -newkey rsa:2048 \
+  -sha1 \
+  -days 3650 \
+  -nodes \
+  -x509 \
+  -keyout ${certs}/${server}-ssl.key \
+  -out ${certs}/${server}-ssl.crt \
+  -config /tmp/openssl.cnf
+
+  rm /tmp/openssl.cnf
+  security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${certs}/${server}-ssl.crt
+}
+
+function add(){
+  echo "Adding site:"
+  echo "PATH=\"$SITEPATH\""
+  echo "HOST=\"$SITEHOST\""
+  [[ ! -f ${certs}/${server}-ssl.crt || ! -f ${certs}/${server}-ssl.key ]] && create_cert
+
+  cat > $host <<-EOF
+<VirtualHost _default_:80>
+  ServerName $server.$TLD
+  DocumentRoot "$SITEPATH"
+  <Directory "$SITEPATH">
+    Options Indexes FollowSymLinks
+    AllowOverride All
+    Order allow,deny
+    Require all granted
+  </Directory>
+</VirtualHost>
+
+<VirtualHost _default_:443>
+  ServerName $server.$TLD
+  SSLEngine on
+  SSLCipherSuite ALL:!ADH:!EXPORT56:RC4+RSA:+HIGH:+MEDIUM:+LOW:+SSLv2:+EXP:+eNULL
+  SSLCertificateFile "${certs}/${server}-ssl.crt"
+  SSLCertificateKeyFile "${certs}/${server}-ssl.key"
+  DocumentRoot "$SITEPATH"
+  <Directory "$SITEPATH">
+    Options Indexes FollowSymLinks
+    AllowOverride All
+    Order allow,deny
+    Allow from all
+    Require all granted
+  </Directory>
+</VirtualHost>
+
+EOF
+}
+
+function remove() {
+  echo "Removing site:"
+  echo "PATH=\"$SITEPATH\""
+  echo "HOST=\"$SITEHOST\""
+  [ -f $host ] && rm -rf $host
+  security delete-certificate -c $server.$TLD -t /Library/Keychains/System.keychain 2>/dev/null
+  [ -f ${certs}/${server}-ssl.crt ] && rm -rf ${certs}/${server}-ssl.crt 
+  [ -f ${certs}/${server}-ssl.key ] && rm -rf ${certs}/${server}-ssl.key
+}
+
+[ ! -d $hosts ] && mkdir -p $hosts
+[ ! -d $vhost_dir ] && mkdir -p $vhost_dir
+[ ! -f $vhosts ] && touch $vhosts
+[ ! -d $certs ] && mkdir -p $certs
+
+if [[ "$ACTION" == "remove" ]];
+  then
+  remove
+else
+  add
+fi
+
+cat > $vhosts <<-EOF
+# 
+# Set up permissions for VirtualHosts in ~/Sites 
+# 
+<Directory "$HOME/Sites"> 
+    Options Indexes FollowSymLinks MultiViews 
+    AllowOverride All 
+    Order allow,deny 
+    Allow from all 
+</Directory> 
+ 
+# 
+# VirtualHosts below 
+# 
+`cat $hosts/*.conf`
+EOF
+
+cat > /private/etc/hosts <<-EOF
+##
+# Host Database
+#
+# localhost is used to configure the loopback interface
+# when the system is booting.  Do not change this entry.
+##
+127.0.0.1           localhost
+255.255.255.255     broadcasthost
+::1                 localhost 
+fe80::1%lo0         localhost
+EOF
+
+for i in `ls $hosts | grep conf`; 
+  do 
+  echo "127.0.0.1           ${i%%.*}.$TLD" >> /private/etc/hosts
+done
+
+# Flush Cache
+dscacheutil -flushcache
+
+# Restart apache if it's running
+[[ `ps aux | grep httpd | grep -v grep` ]] && httpd -k restart
+
