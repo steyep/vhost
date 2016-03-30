@@ -155,16 +155,6 @@ fi
 
 cat > $vhosts <<-EOF
 # 
-# Set up permissions for VirtualHosts in ~/Sites 
-# 
-<Directory "$HOME/Sites"> 
-    Options Indexes FollowSymLinks MultiViews 
-    AllowOverride All 
-    Order allow,deny 
-    Allow from all 
-</Directory> 
- 
-# 
 # VirtualHosts below 
 # 
 `cat $hosts/*.conf`
