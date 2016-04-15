@@ -4,23 +4,73 @@ if [ "$(id -u)" != "0" ]; then
   exit 1
 fi
 
+cfg=$(dirname ${BASH_SOURCE[0]})/.settings.cfg
+
+function config() {
+  if [ ! -f $cfg ]
+    then
+    echo
+    echo "* No settings file found."
+    echo "  Default settings created"
+    echo "  Take a look and tweak as you see fit!"
+    echo 
+    cat <<'EOF' > $cfg
+# Top Level Domain
+TLD="dev"
+
+# Path to save SSL certificates/keys
+certs="$HOME/ssl-certs"
+
+# Path to save individual host configurations
+hosts="/etc/hosts.d"
+
+# Path to vhost.conf file
+vhosts="/etc/apache2/other/httpd-vhosts.conf"
+
+# HTTP Port
+port=80
+
+# HTTPS Port (TLS/SSL)
+ssl_port=443
+
+# Create SSL by default
+SSL=false
+
+EOF
+  fi
+  ${EDITOR:-vi} $cfg
+  exit 0
+}
+
+# Import config file
+[ ! -f $cfg ] && config
+. $cfg
+
+[ -z $SSL ] && SSL=false
+
 function show_help() {
   echo 
-  echo "  Usage: $(basename "$0") { add | remove | help } [ --options ]" >&2
+  echo "  Usage: $(basename "$0") { action } [ --options ]" >&2
   echo
   echo "  Action (Required)" 
+  echo "    certs             Generate Certificate/Key for a host (default: \"$(basename "$SITEPATH")\")"
   echo "    add               Add this site to the list of VirtualHosts"
   echo "    remove, rm        Remove this site from the list of VirtualHosts"
+  echo "    edit              Edit the associated files in \`${EDITOR:-vi}\`"
+  echo "    config            Configure paths/variables/ports for your VirtualHosts"
   echo "    help              Show this message"
   echo 
   echo "  Options"
   echo "    --path, -p        Path to site root (default: \"$PWD\")"
   echo "    --host, -h        Hostname for local site (default: \"$(basename "$SITEPATH")\")"
+  echo "    --file-host, -f   Base URL to search for files in \`sites/*/files\`"
+  echo "                      Requires \`rewrite_mod\` to be enabled"
+  echo "    --ssl             (Boolean) Create SSL hosts configured on port <$ssl_port>"
+  echo "                      Default: $SSL"
   echo
   exit 0
 }
 
-# vhosts 
 while [[ $# > 0 ]]
 do
 key="$1"
@@ -34,14 +84,32 @@ case $key in
     SITEHOST="$2"
     shift # past argument
     ;;
+    --ssl)
+    SSL="$2"
+    shift
+    ;;
+    -f|--file-host)
+    filesURL="$2"
+    shift # past argument
+    ;;
     add)
     ACTION="add"
+    ;;
+    certs)
+    ACTION="create_cert"
     ;;
     rm|remove)
     ACTION="remove"
     ;;
+    edit)
+    ACTION="edit"
+    break
+    ;;
     help)
-    show_help
+      show_help
+    ;;
+    config)
+      config
     ;;
     *)
       show_help
@@ -55,14 +123,19 @@ done
 [ -z $ACTION ] && show_help
 
 server="$SITEHOST"
-TLD="ste"
-certs="/usr/local/etc/apache2/2.4/ssl"
-vhost_dir="/usr/local/etc/apache2/2.4/other"
-vhosts="$vhost_dir/httpd-vhosts.conf"
-hosts="/private/etc/hosts.d"
+vhost_dir="$(dirname $vhosts)"
+host_file="/private/etc/hosts"
 host="$hosts/$server.conf"
+sendSSL=""
+FILES="</VirtualHost>"
+
+function edit() {
+  ${EDITOR:-vi} `echo $certs $vhosts $hosts`
+  exit 0
+}
 
 function create_cert() {
+  [ ! -d $certs ] && mkdir -p $certs
   cat > /tmp/openssl.cnf <<-EOF
   [req]
   distinguished_name = req_distinguished_name
@@ -95,29 +168,42 @@ EOF
 }
 
 function add(){
+  echo
   echo "Adding site:"
   echo "PATH=\"$SITEPATH\""
   echo "HOST=\"$SITEHOST\""
-  [[ ! -f ${certs}/${server}-ssl.crt || ! -f ${certs}/${server}-ssl.key ]] && create_cert
+  
+  if [ "$SSL" == "true" ];
+    then
+    [[ ! -f ${certs}/${server}-ssl.crt || ! -f ${certs}/${server}-ssl.key ]] && create_cert
+    sendSSL=$(cat <<-EOF
+  
+  <IfModule mod_rewrite.c>
+    RewriteEngine on
+    RewriteCond %{SERVER_PORT} !^$ssl_port\$
+    RewriteRule ^/(.*) https://%{HTTP_HOST}/
+  </IfModule>
+EOF
+)
+  fi
 
-  cat > $host <<-EOF
-<VirtualHost _default_:80>
-  ServerName $server.$TLD
-  DocumentRoot "$SITEPATH"
-  <Directory "$SITEPATH">
-    Options Indexes FollowSymLinks
-    AllowOverride All
-    Order allow,deny
-    Require all granted
-  </Directory>
+  if [ ! -z $filesURL ]; 
+    then
+    FILES=$(cat <<-EOF
+  <IfModule mod_rewrite.c>
+    RewriteEngine on
+    RewriteCond %{REQUEST_URI} ^/?sites/[^\/]*/files/.*$
+    RewriteCond %{REQUEST_URI} !^/?sites/[^\/]*/files/css/.*$
+    RewriteCond %{REQUEST_URI} !^/?sites/[^\/]*/files/js/.*$
+    RewriteRule ^(.*)$ $filesURL/\$1
+  </IfModule>
 </VirtualHost>
-
-<VirtualHost _default_:443>
+EOF
+)
+  fi
+  
+  DIRECTORY=$(cat <<-EOF
   ServerName $server.$TLD
-  SSLEngine on
-  SSLCipherSuite ALL:!ADH:!EXPORT56:RC4+RSA:+HIGH:+MEDIUM:+LOW:+SSLv2:+EXP:+eNULL
-  SSLCertificateFile "${certs}/${server}-ssl.crt"
-  SSLCertificateKeyFile "${certs}/${server}-ssl.key"
   DocumentRoot "$SITEPATH"
   <Directory "$SITEPATH">
     Options Indexes FollowSymLinks
@@ -126,41 +212,72 @@ function add(){
     Allow from all
     Require all granted
   </Directory>
+EOF
+)
+
+  cat > $host <<-EOF
+<VirtualHost _default_:$port>$sendSSL
+$DIRECTORY
+EOF
+if [ "$SSL" == "true" ];
+  then
+  cat >> $host <<-EOF
 </VirtualHost>
 
+<VirtualHost _default_:$ssl_port>
+  SSLEngine on
+  SSLCipherSuite ALL:!ADH:!EXPORT56:RC4+RSA:+HIGH:+MEDIUM:+LOW:+SSLv2:+EXP:+eNULL
+  SSLCertificateFile "${certs}/${server}-ssl.crt"
+  SSLCertificateKeyFile "${certs}/${server}-ssl.key"
+$DIRECTORY
 EOF
+fi
+
+cat >> $host <<-EOF
+$FILES
+
+EOF
+echo
 }
 
 function remove() {
-  echo "Removing site:"
-  echo "PATH=\"$SITEPATH\""
-  echo "HOST=\"$SITEHOST\""
-  [ -f $host ] && rm -rf $host
+  echo
+  local flag=false
+  if [ -f $host ]; then
+    flag=true
+    echo "Removing site:"
+    echo "  PATH=\"$SITEPATH\""
+    echo "  HOST=\"$SITEHOST\""
+    rm -rfv $host
+  fi
   security delete-certificate -c $server.$TLD -t /Library/Keychains/System.keychain 2>/dev/null
-  [ -f ${certs}/${server}-ssl.crt ] && rm -rf ${certs}/${server}-ssl.crt 
-  [ -f ${certs}/${server}-ssl.key ] && rm -rf ${certs}/${server}-ssl.key
+  if [ -f ${certs}/${server}-ssl.crt ]; then
+    flag=true
+    echo "  Removing Certificate:"
+    rm -rfv ${certs}/${server}-ssl.crt 
+  fi
+  if [ -f ${certs}/${server}-ssl.key ]; then
+    flag=true
+    echo "  Removing Key:"
+    rm -rfv ${certs}/${server}-ssl.key
+  fi
+  if [ $flag == "false" ]; then
+    echo "Unable to remove site:"
+    echo "PATH=\"$SITEPATH\""
+    echo "HOST=\"$SITEHOST\""
+    echo
+  fi
 }
 
 [ ! -d $hosts ] && mkdir -p $hosts
 [ ! -d $vhost_dir ] && mkdir -p $vhost_dir
 [ ! -f $vhosts ] && touch $vhosts
-[ ! -d $certs ] && mkdir -p $certs
 
-if [[ "$ACTION" == "remove" ]];
-  then
-  remove
-else
-  add
-fi
+$ACTION
 
-cat > $vhosts <<-EOF
-# 
-# VirtualHosts below 
-# 
-`cat $hosts/*.conf`
-EOF
+cat $hosts/*.conf > $vhosts 2>/dev/null
 
-cat > /private/etc/hosts <<-EOF
+cat > $host_file <<-EOF
 ##
 # Host Database
 #
@@ -175,7 +292,7 @@ EOF
 
 for i in `ls $hosts | grep conf`; 
   do 
-  echo "127.0.0.1           ${i%%.*}.$TLD" >> /private/etc/hosts
+  echo "127.0.0.1           ${i%%.*}.$TLD" >> $host_file
 done
 
 # Flush Cache
