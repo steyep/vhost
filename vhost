@@ -21,9 +21,6 @@ TLD="dev"
 # Path to save SSL certificates/keys
 certs="$HOME/ssl-certs"
 
-# Path to save individual host configurations
-hosts="/etc/hosts.d"
-
 # Path to vhost.conf file
 vhosts="/etc/apache2/other/httpd-vhosts.conf"
 
@@ -56,6 +53,8 @@ function show_help() {
   echo "    certs             Generate Certificate/Key for a host (default: \"$(basename "$SITEPATH")\")"
   echo "    add               Add this site to the list of VirtualHosts"
   echo "    remove, rm        Remove this site from the list of VirtualHosts"
+  echo "    enable, en        Enable this site"
+  echo "    disable, dis      Remove this site from the list of VirtualHosts"
   echo "    edit              Edit the associated files in \`${EDITOR:-vi}\`"
   echo "    config            Configure paths/variables/ports for your VirtualHosts"
   echo "    help              Show this message"
@@ -105,6 +104,12 @@ case $key in
     ACTION="edit"
     break
     ;;
+    en|enable)
+    ACTION="enable_site"
+    ;;
+    dis|disable)
+    ACTION="disable_site"
+    ;;
     help)
       show_help
     ;;
@@ -125,7 +130,8 @@ done
 server="$SITEHOST"
 vhost_dir="$(dirname $vhosts)"
 host_file="/private/etc/hosts"
-host="$hosts/$server.conf"
+hosts="./sites"
+host="$hosts/enabled/$server.conf"
 sendSSL=""
 FILES="</VirtualHost>"
 
@@ -165,6 +171,33 @@ EOF
 
   rm /tmp/openssl.cnf
   security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${certs}/${server}-ssl.crt
+}
+
+function toggle_site(){
+  local after="$1"
+  local state="$hosts/enabled/$server.conf"
+  if [[ ! $(find $hosts -maxdepth 2 -type f -name $server.conf) ]]; then
+    echo "Error: \"$server\" not found"
+    exit 1 
+  fi
+
+  [[ "$after" == "enabled" ]] && state="$hosts/disabled/$server.conf"
+  if [[ "$(mv "$state" "$hosts/$after/$server.conf" 2>&1)" ]]; then 
+    echo "\"$server\" has already been $after!"
+    exit 0
+  fi
+}
+
+function enable_site(){
+  toggle_site "enabled"
+  echo "Enabling site:"
+  echo "HOST=\"$SITEHOST\""
+}
+
+function disable_site(){
+  toggle_site "disabled"
+  echo "Disabling site:"
+  echo "HOST=\"$SITEHOST\""
 }
 
 function add(){
@@ -243,14 +276,14 @@ echo
 function remove() {
   echo
   local flag=false
-  if [ -f $host ]; then
+  security delete-certificate -c $server.$TLD -t /Library/Keychains/System.keychain 2>/dev/null
+  if [[ $(find $hosts -maxdepth 2 -type f -name $server.conf) ]]; then
     flag=true
-    echo "Removing site:"
+    echo "  Removing VirtualHost Configuration:"
     echo "  PATH=\"$SITEPATH\""
     echo "  HOST=\"$SITEHOST\""
-    rm -rfv $host
+    find $hosts -maxdepth 2 -type f -name $server.conf -delete
   fi
-  security delete-certificate -c $server.$TLD -t /Library/Keychains/System.keychain 2>/dev/null
   if [ -f ${certs}/${server}-ssl.crt ]; then
     flag=true
     echo "  Removing Certificate:"
@@ -269,13 +302,18 @@ function remove() {
   fi
 }
 
-[ ! -d $hosts ] && mkdir -p $hosts
+
 [ ! -d $vhost_dir ] && mkdir -p $vhost_dir
 [ ! -f $vhosts ] && touch $vhosts
 
+for i in $hosts/{enabled,disabled}
+  do 
+  [ ! -d $i ] && mkdir -p $i 
+done
+
 $ACTION
 
-cat $hosts/*.conf > $vhosts 2>/dev/null
+cat $hosts/enabled/*.conf > $vhosts 2>/dev/null
 
 cat > $host_file <<-EOF
 ##
@@ -290,14 +328,15 @@ cat > $host_file <<-EOF
 fe80::1%lo0         localhost
 EOF
 
-for i in `ls $hosts | grep conf`; 
+for i in $(find ./sites/enabled -type f -name "*.conf");
   do 
-  echo "127.0.0.1           ${i%%.*}.$TLD" >> $host_file
+  this_host=$(basename "$i")
+  echo "127.0.0.1           ${this_host%%.*}.$TLD" >> $host_file
 done
 
 # Flush Cache
 dscacheutil -flushcache
 
 # Restart apache if it's running
-[[ `ps aux | grep httpd | grep -v grep` ]] && httpd -k restart
+[ -f /usr/local/var/run/apache2/httpd.pid ] && httpd -k restart
 

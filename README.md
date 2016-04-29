@@ -12,7 +12,7 @@ This script is for updating all of the files associated with adding a new local 
 * Cloning from source:
 	
 	```
-	git clone git@github.com:steyep/vhost.git && cd ./vhost/`
+	git clone git@github.com:steyep/vhost.git && cd ./vhost/
 	chmod +x vhost
 	sudo ln -sv $PWD/vhost /usr/bin/vhost
 	```
@@ -51,6 +51,6 @@ This script is for updating all of the files associated with adding a new local 
 * Remove example sites: 
 
 	```
-	sudo vhost rm site1
-	sudo vhost rm myssl-site
+	sudo vhost rm --host site1
+	sudo vhost rm --host myssl-site
 	```
