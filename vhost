@@ -1,83 +1,102 @@
-#!/bin/bash
-if [ "$(id -u)" != "0" ]; then
-  echo "Error: \"$(basename "$0")\" must run as root"
-  exit 1
-fi
+#!/bin/sh
 
-function show_help() {
-  echo 
-  echo "  Usage: $(basename "$0") { add | remove | help } [ --options ]" >&2
-  echo
-  echo "  Action (Required)" 
-  echo "    add               Add this site to the list of VirtualHosts"
-  echo "    remove, rm        Remove this site from the list of VirtualHosts"
-  echo "    help              Show this message"
-  echo 
-  echo "  Options"
-  echo "    --path, -p        Path to site root (default: \"$PWD\")"
-  echo "    --host, -h        Hostname for local site (default: \"$(basename "$SITEPATH")\")"
-  echo
-  exit 0
-}
+script=$(basename "$0")
+action="$1"
+shift
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-# vhosts 
-while [[ $# > 0 ]]
-do
-key="$1"
+config_dir=$HOME/.vhost
+config_file=$config_dir/vhost.cfg
+# hosts="/private/etc/hosts.d"
+hosts=$config_dir/hosts.d
+# certs="/usr/local/etc/apache2/2.4/ssl"
+certs=$config_dir/certs
 
-case $key in
-    -p|--path)
-    SITEPATH="$2"
-    shift # past argument
-    ;;
-    -h|--host)
-    SITEHOST="$2"
-    shift # past argument
-    ;;
-    add)
-    ACTION="add"
-    ;;
-    rm|remove)
-    ACTION="remove"
-    ;;
-    help)
-    show_help
-    ;;
-    *)
-      show_help
-    ;;
-esac
-shift # past argument or value
-done
-
-[ -z $SITEPATH ] && SITEPATH="$PWD"
-[ -z $SITEHOST ] && SITEHOST="$(basename "$SITEPATH")"
-[ -z $ACTION ] && show_help
-
+# TLD="ste"
+tld_default="dev"
 server="$SITEHOST"
-TLD="ste"
-certs="/usr/local/etc/apache2/2.4/ssl"
 vhost_dir="/usr/local/etc/apache2/2.4/other"
 vhosts="$vhost_dir/httpd-vhosts.conf"
-hosts="/private/etc/hosts.d"
 host="$hosts/$server.conf"
 
-function create_cert() {
-  cat > /tmp/openssl.cnf <<-EOF
+test -d $config_dir || mkdir $config_dir
+test -d $hosts || mkdir $hosts
+test -f $config_file || cat > $config_file <<CONFIG_FILE
+# The top level domain of your server. (Defaults to "$tld_default")
+tld=
+# The directory of your Apache vhost.
+vhost_dir=
+CONFIG_FILE
+
+# Load user config.
+source $config_file
+
+function show_menu() {
+	cat <<-END_MENU
+
+  Usage: $script <action> [options]
+
+  The following actions are supported:
+    list | ls                          : List the configured VirtualHosts
+    add <site> [options]               : Add a site to the list of VirtualHosts
+    remove <site>                      : Remove a site from the list of VirtualHosts
+    help                               : Show this message
+
+  The following options are supported:
+	  --path </path/to/webroot>          : Absolute path to the web root
+	  --no-ssl                           : Do not create SSL certificate for VirtualHost
+	  --files-url <https://sample.com>   : URL to use for file path rewrite
+
+	END_MENU
+}
+
+# Functions.
+error() {
+  echo ${RED}'Error: '${NC}${1};
+  echo
+  return 1;
+}
+
+success() { echo '\n\033[0;32m\xE2\x9C\x94\033[0m '"$1"; }
+validate_option() { echo "${1:--}" | grep -q -- '^-' && return 1 || return 0; }
+get_server_name() { echo "${1}.${tld:-${tld_default}}"; }
+
+list_vhosts() {
+	ls $hosts
+}
+
+remove_vhost() {
+	local vhost="$1"
+	test -d "${hosts}/${vhost:--}" || { error "\"$vhost\" does not exist"; exit 1; }
+	rm -rf ${hosts}/${vhost} &> /dev/null
+	security delete-certificate -c "$(get_server_name "$vhost")" -t /Library/Keychains/System.keychain 2>/dev/null
+	success "$vhost removed"
+}
+
+create_cert() {
+	local host="$1"
+	local server_name="$(get_server_name $host)"
+
+	test -d $certs || mkdir -p "$certs" &> /dev/null
+
+  cat > /tmp/openssl.cnf <<-SSL_CERT
   [req]
   distinguished_name = req_distinguished_name
   x509_extensions = v3_req
   prompt = no
   [req_distinguished_name]
-  CN = *.${server}.$TLD
+  CN = *.${server_name}
   [v3_req]
   keyUsage = nonRepudiation, digitalSignature, keyEncipherment
   extendedKeyUsage = serverAuth
   subjectAltName = @alt_names
   [alt_names]
-  DNS.1 = *.${server}.$TLD
-  DNS.2 = ${server}.$TLD
-EOF
+  DNS.1 = *.${server_name}
+  DNS.2 = ${server_name}
+	SSL_CERT
 
   openssl req \
   -new \
@@ -86,111 +105,192 @@ EOF
   -days 3650 \
   -nodes \
   -x509 \
-  -keyout ${certs}/${server}-ssl.key \
-  -out ${certs}/${server}-ssl.crt \
+  -keyout ${certs}/${host}-ssl.key \
+  -out ${certs}/${host}-ssl.crt \
   -config /tmp/openssl.cnf
 
   rm /tmp/openssl.cnf
-  security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${certs}/${server}-ssl.crt
+  security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${certs}/${host}-ssl.crt
 }
 
-function add(){
-  echo "Adding site:"
-  echo "PATH=\"$SITEPATH\""
-  echo "HOST=\"$SITEHOST\""
-  [[ ! -f ${certs}/${server}-ssl.crt || ! -f ${certs}/${server}-ssl.key ]] && create_cert
+create_apache_vhost() {
+	cat hosts/**/*conf
+}
 
-  cat > $host <<-EOF
-<VirtualHost _default_:80>
-  ServerName $server.$TLD
-  DocumentRoot "$SITEPATH"
-  <Directory "$SITEPATH">
-    Options Indexes FollowSymLinks
-    AllowOverride All
-    Order allow,deny
-    Require all granted
-  </Directory>
-</VirtualHost>
+add_vhost() {
+	local host="$1"
+	validate_option "$host" && shift || {
+		error "First argument must be the site name";
+		exit 1;
+	}
 
-<VirtualHost _default_:443>
-  ServerName $server.$TLD
+	local vhost_configuration_dir="$hosts/$host"
+	if [[ ! -f $vhost_configuration_dir/config ]]; then
+		local site_root_default="$PWD"
+		local use_ssl_default="1"
+		local files_rewrite_url_default=""
+		local server_name_default="$(get_server_name $host)"
+
+		while (( $# > 0 )); do
+			case "$1" in
+				--no-ssl) use_ssl_default="0" && shift;;
+				--files-url) validate_option "$2" && files_rewrite_url_default="$2" || {
+						error "The 'files-url' option requires 1 parameter";
+						exit 1;
+					}
+					shift 2;;
+				--path) validate_option "$2" && site_root_default="$2" || {
+						error "The 'path' option requires 1 parameter";
+						exit 1;
+					}
+					shift 2;;
+				*) shift ;;
+			esac
+		done;
+
+		read -p "Enter server name [$server_name_default]: " server_name
+		read -p "Enter path to local site root [$site_root_default]: " path
+		read -p "(Optional) Enter a URL to use for the site's files [$files_rewrite_url_default]: " files_rewrite_url
+		read -p "Site uses SSL (1/0) [$use_ssl_default]: " use_ssl
+
+		local vhost_configuration_dir="$hosts/$host"
+		mkdir -p $vhost_configuration_dir
+
+		cat > $vhost_configuration_dir/config <<-SETTINGS
+		server_name="${server_name:-$server_name_default}"
+		path="${path:-$site_root_default}"
+		files_rewrite_url="${files_rewrite_url:-$files_rewrite_url_default}"
+		use_ssl="${use_ssl:-$use_ssl_default}"
+		SETTINGS
+	fi
+
+	source $vhost_configuration_dir/config
+
+	if [[ "$use_ssl" == "1" ]]; then
+		create_cert $host
+	fi
+
+	cat > $vhost_configuration_dir/${host}.conf <<-VHOST_CONFIG
+	<VirtualHost _default_:80> $([[ "$use_ssl" == "1" ]] && echo '
+  <IfModule mod_rewrite.c>
+    RewriteEngine on
+    RewriteCond %{SERVER_PORT} !^443$
+    RewriteRule ^/(.*) https://%{HTTP_HOST}/
+  </IfModule>')
+	  ServerName $server_name
+	  DocumentRoot "$path"
+	  <Directory "$path">
+	    Options Indexes FollowSymLinks
+	    AllowOverride All
+	    Order allow,deny
+	    Allow from all
+	    Require all granted
+	  </Directory>
+	</VirtualHost>
+	$([[ "$use_ssl" == "1" ]] && echo '
+	<VirtualHost _default_:443>
   SSLEngine on
   SSLCipherSuite ALL:!ADH:!EXPORT56:RC4+RSA:+HIGH:+MEDIUM:+LOW:+SSLv2:+EXP:+eNULL
-  SSLCertificateFile "${certs}/${server}-ssl.crt"
-  SSLCertificateKeyFile "${certs}/${server}-ssl.key"
-  DocumentRoot "$SITEPATH"
-  <Directory "$SITEPATH">
+  SSLCertificateFile "'${certs}/${host}-ssl.crt'"
+  SSLCertificateKeyFile "'${certs}/${host}-ssl.key'"
+  ServerName '$server_name'
+  DocumentRoot "'$path'"
+  <Directory "'$path'">
     Options Indexes FollowSymLinks
-    AllowOverride All
-    Order allow,deny
+    AllowOverride AllOrder allow,deny
     Allow from all
     Require all granted
-  </Directory>
-</VirtualHost>
-
-EOF
+  </Directory>'"$([[ "$files_rewrite_url" ]] && echo '
+  <IfModule mod_rewrite.c>
+    RewriteEngine on
+    RewriteCond %{REQUEST_URI} ^/?sites/[^\/]*/files/.*$
+    RewriteCond %{REQUEST_URI} !^/?sites/[^\/]*/files/css/.*$
+    RewriteCond %{REQUEST_URI} !^/?sites/[^\/]*/files/js/.*$
+    RewriteRule ^(.*)$ '$files_rewrite_url'/$1
+  </IfModule>')"'
+	</VirtualHost>')
+	VHOST_CONFIG
 }
 
-function remove() {
-  echo "Removing site:"
-  echo "PATH=\"$SITEPATH\""
-  echo "HOST=\"$SITEHOST\""
-  [ -f $host ] && rm -rf $host
-  security delete-certificate -c $server.$TLD -t /Library/Keychains/System.keychain 2>/dev/null
-  [ -f ${certs}/${server}-ssl.crt ] && rm -rf ${certs}/${server}-ssl.crt 
-  [ -f ${certs}/${server}-ssl.key ] && rm -rf ${certs}/${server}-ssl.key
-}
+case "$action" in
+  list|ls) list_vhosts && exit ;;
+	add) add_vhost $@;;
+	remove|rm) remove_vhost $@ ;;
+	*) show_menu && exit ;;
+esac
 
-[ ! -d $hosts ] && mkdir -p $hosts
-[ ! -d $vhost_dir ] && mkdir -p $vhost_dir
-[ ! -f $vhosts ] && touch $vhosts
-[ ! -d $certs ] && mkdir -p $certs
+# [ -z $SITEPATH ] && SITEPATH="$PWD"
+# [ -z $SITEHOST ] && SITEHOST="$(basename "$SITEPATH")"
+# [ -z $ACTION ] && show_help
 
-if [[ "$ACTION" == "remove" ]];
-  then
-  remove
-else
-  add
-fi
+# server="$SITEHOST"
+# TLD="ste"
+# certs="/usr/local/etc/apache2/2.4/ssl"
+# vhost_dir="/usr/local/etc/apache2/2.4/other"
+# vhosts="$vhost_dir/httpd-vhosts.conf"
+# hosts="/private/etc/hosts.d"
+# host="$hosts/$server.conf"
 
-cat > $vhosts <<-EOF
-# 
-# Set up permissions for VirtualHosts in ~/Sites 
-# 
-<Directory "$HOME/Sites"> 
-    Options Indexes FollowSymLinks MultiViews 
-    AllowOverride All 
-    Order allow,deny 
-    Allow from all 
-</Directory> 
- 
-# 
-# VirtualHosts below 
-# 
-`cat $hosts/*.conf`
-EOF
+# function remove() {
+#   echo "Removing site:"
+#   echo "PATH=\"$SITEPATH\""
+#   echo "HOST=\"$SITEHOST\""
+#   [ -f $host ] && rm -rf $host
+#   security delete-certificate -c $server.$TLD -t /Library/Keychains/System.keychain 2>/dev/null
+#   [ -f ${certs}/${server}-ssl.crt ] && rm -rf ${certs}/${server}-ssl.crt
+#   [ -f ${certs}/${server}-ssl.key ] && rm -rf ${certs}/${server}-ssl.key
+# }
 
-cat > /private/etc/hosts <<-EOF
-##
-# Host Database
-#
-# localhost is used to configure the loopback interface
-# when the system is booting.  Do not change this entry.
-##
-127.0.0.1           localhost
-255.255.255.255     broadcasthost
-::1                 localhost 
-fe80::1%lo0         localhost
-EOF
+# [ ! -d $hosts ] && mkdir -p $hosts
+# [ ! -d $vhost_dir ] && mkdir -p $vhost_dir
+# [ ! -f $vhosts ] && touch $vhosts
+# [ ! -d $certs ] && mkdir -p $certs
 
-for i in `ls $hosts | grep conf`; 
-  do 
-  echo "127.0.0.1           ${i%%.*}.$TLD" >> /private/etc/hosts
-done
+# if [[ "$ACTION" == "remove" ]];
+#   then
+#   remove
+# else
+#   add
+# fi
 
-# Flush Cache
-dscacheutil -flushcache
+# cat > $vhosts <<-EOF
+# #
+# # Set up permissions for VirtualHosts in ~/Sites
+# #
+# <Directory "$HOME/Sites">
+#     Options Indexes FollowSymLinks MultiViews
+#     AllowOverride All
+#     Order allow,deny
+#     Allow from all
+# </Directory>
 
-# Restart apache if it's running
-[[ `ps aux | grep httpd | grep -v grep` ]] && httpd -k restart
+# #
+# # VirtualHosts below
+# #
+# `cat $hosts/*.conf`
+# EOF
+
+# cat > /private/etc/hosts <<-EOF
+# ##
+# # Host Database
+# #
+# # localhost is used to configure the loopback interface
+# # when the system is booting.  Do not change this entry.
+# ##
+# 127.0.0.1           localhost
+# 255.255.255.255     broadcasthost
+# ::1                 localhost
+# fe80::1%lo0         localhost
+# EOF
+
+# for i in `ls $hosts | grep conf`;
+#   do
+#   echo "127.0.0.1           ${i%%.*}.$TLD" >> /private/etc/hosts
+# done
+
+# # Flush Cache
+# dscacheutil -flushcache
+
+# # Restart apache if it's running
+# [[ `ps aux | grep httpd | grep -v grep` ]] && httpd -k restart
 
